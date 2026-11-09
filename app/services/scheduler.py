@@ -4,10 +4,11 @@ from apscheduler.triggers.cron import CronTrigger
 from app.core.config import settings
 from app.database.session import SessionLocal
 from app.services.billing import BillingService
+from app.core.utils import tz
 
 logger = logging.getLogger(__name__)
 
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=tz())
 
 
 async def run_daily_billing_job():
@@ -33,16 +34,19 @@ def start_scheduler():
     trigger = CronTrigger(
         hour=settings.BILLING_RUN_HOUR,
         minute=settings.BILLING_RUN_MINUTE,
+        timezone=tz(),
     )
     scheduler.add_job(
         run_daily_billing_job,
         trigger=trigger,
         id="daily_billing_job",
         replace_existing=True,
+        misfire_grace_time=3600,  # se o servidor estava dormindo no horário, roda em até 1h depois
+        coalesce=True,
     )
     scheduler.start()
     logger.info(
-        f"Agendador de cobrança iniciado. Execução diária programada para as {settings.BILLING_RUN_HOUR:02d}:{settings.BILLING_RUN_MINUTE:02d}."
+        f"Agendador de cobrança iniciado. Execução diária programada para as {settings.BILLING_RUN_HOUR:02d}:{settings.BILLING_RUN_MINUTE:02d} ({settings.TIMEZONE})."
     )
 
 

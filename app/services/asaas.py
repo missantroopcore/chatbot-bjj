@@ -7,6 +7,23 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+class AsaasError(Exception):
+    pass
+
+
+def _describe(err: httpx.HTTPStatusError) -> str:
+    """Mensagem legível do erro do Asaas (ex.: CPF inválido, chave sem permissão)."""
+    status_code = err.response.status_code
+    try:
+        errors = err.response.json().get("errors", [])
+        detail = "; ".join(e.get("description", "") for e in errors) or err.response.text
+    except ValueError:
+        detail = err.response.text
+    if status_code == 401:
+        detail = "Chave de API do Asaas inválida ou do ambiente errado (sandbox x produção). " + detail
+    return f"Asaas HTTP {status_code}: {detail}"
+
+
 class AsaasService:
     def __init__(self):
         self.base_url = settings.asaas_base_url
@@ -32,6 +49,7 @@ class AsaasService:
     ) -> str:
         """
         Cria um cliente no Asaas ou retorna o ID caso já exista.
+        Atenção: o Asaas exige CPF/CNPJ do cliente para emitir cobrança.
         """
         clean_phone = phone.replace("+", "").replace("-", "").replace(" ", "").strip()
         local_phone = clean_phone[2:] if clean_phone.startswith("55") else clean_phone
@@ -43,9 +61,9 @@ class AsaasService:
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                query_param = f"cpfCnpj={cpf}" if cpf else f"mobilePhone={local_phone}"
-                search_url = f"{self.base_url}/customers?{query_param}"
-                resp = await client.get(search_url, headers=self.headers)
+                clean_cpf = "".join(ch for ch in (cpf or "") if ch.isdigit())
+                params = {"cpfCnpj": clean_cpf} if clean_cpf else {"mobilePhone": local_phone}
+                resp = await client.get(f"{self.base_url}/customers", params=params, headers=self.headers)
                 
                 if resp.is_success:
                     data = resp.json()
@@ -56,8 +74,8 @@ class AsaasService:
                     "name": name,
                     "mobilePhone": local_phone,
                 }
-                if cpf:
-                    payload["cpfCnpj"] = cpf.replace(".", "").replace("-", "").strip()
+                if clean_cpf:
+                    payload["cpfCnpj"] = clean_cpf
                 if email:
                     payload["email"] = email
 
@@ -70,13 +88,7 @@ class AsaasService:
                 customer_data = create_resp.json()
                 return customer_data["id"]
         except httpx.HTTPStatusError as err:
-            if err.response.status_code == 401:
-                mock_id = f"cus_simulated_{uuid.uuid4().hex[:8]}"
-                logger.warning(
-                    f"[AVISO ASAAS] Chave de API não autorizada (401). Utilizando simulação de cliente: {mock_id}"
-                )
-                return mock_id
-            raise
+            raise AsaasError(_describe(err)) from err
 
     async def create_pix_charge(
         self,
@@ -139,19 +151,18 @@ class AsaasService:
                     "pix_qr_code_url": pix_qr_code_url,
                 }
         except httpx.HTTPStatusError as err:
-            if err.response.status_code == 401:
-                mock_pay_id = f"pay_simulated_{uuid.uuid4().hex[:8]}"
-                mock_pix = f"00020126580014br.gov.bcb.pix0136{uuid.uuid4()}520400005303986540{value:.2f}5802BR5915JiuJitsuSchool6009SaoPaulo62070503***6304"
-                logger.warning(
-                    f"[AVISO ASAAS] Chave de API não autorizada (401). Utilizando cobrança simulada: {mock_pay_id}"
-                )
-                return {
-                    "payment_id": mock_pay_id,
-                    "invoice_url": f"https://sandbox.asaas.com/i/{mock_pay_id}",
-                    "pix_copy_paste": mock_pix,
-                    "pix_qr_code_url": None,
-                }
-            raise
+            raise AsaasError(_describe(err)) from err
+
+    async def cancel_payment(self, payment_id: str) -> None:
+        """Remove a cobrança no Asaas (usado ao cancelar uma fatura)."""
+        if not self.is_configured() or not payment_id or payment_id.startswith("pay_simulated"):
+            return
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.delete(f"{self.base_url}/payments/{payment_id}", headers=self.headers)
+                resp.raise_for_status()
+        except httpx.HTTPStatusError as err:
+            raise AsaasError(_describe(err)) from err
 
 
 asaas_service = AsaasService()

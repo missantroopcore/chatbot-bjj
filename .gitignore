@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Projeto
+.env
+*.db
+*.db-journal
+env_preenchido.txt
