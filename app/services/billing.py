@@ -1,291 +1,229 @@
+"""Geração de faturas mensais e régua de cobrança (D-3, D-0, D+3)."""
 import logging
-from typing import Dict, Any
-from datetime import date, timedelta, datetime
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
+
+from sqlalchemy import extract
 from sqlalchemy.orm import Session
-from app.database.models import Student, Subscription, Invoice, MessageLog
-from app.services.asaas import asaas_service
-from app.services.whatsapp import whatsapp_service
+
 from app.core.config import settings
+from app.core.utils import today_local, due_date_for, add_months, brl
+from app.database.models import Student, Subscription, Invoice
+from app.services.asaas import asaas_service
+from app.services import messaging
+from app.services.whatsapp import WhatsAppError
 
 logger = logging.getLogger(__name__)
 
 
+def _first_name(student: Student) -> str:
+    return (student.name or "").split()[0] if student.name else "aluno(a)"
+
+
 class BillingService:
+    # ------------------------------------------------------------------ #
+    # Geração de faturas
+    # ------------------------------------------------------------------ #
     @staticmethod
-    async def generate_monthly_invoices(db: Session) -> int:
+    def candidate_due_dates(sub: Subscription, today: date) -> List[date]:
         """
-        Varre todas as assinaturas ativas e gera a cobrança do mês corrente se ainda não existir.
-        Gera o Pix no Asaas e armazena os códigos para envio.
+        Vencimentos que devem ter fatura hoje: o do mês corrente (se a matrícula já existia)
+        e o do mês seguinte quando faltam até BILLING_ADVANCE_DAYS dias.
         """
-        today = date.today()
+        enrolled = (sub.created_at or datetime.utcnow()).date()
+        result = []
+        for offset in (0, 1):
+            y, m = add_months(today.year, today.month, offset)
+            d = due_date_for(y, m, sub.due_day)
+            if d < enrolled:
+                continue  # não cobra mês anterior à matrícula
+            if (d - today).days <= settings.BILLING_ADVANCE_DAYS:
+                result.append(d)
+        return result
+
+    @staticmethod
+    async def create_invoice(db: Session, sub: Subscription, due: date, today: date) -> Optional[Invoice]:
+        student, plan = sub.student, sub.plan
+
+        if asaas_service.is_configured() and not student.cpf:
+            print(f"⚠️  [SEM CPF] {student.name}: o Asaas exige CPF para emitir Pix. Cadastre o CPF do aluno.", flush=True)
+            return None
+
+        if not student.asaas_customer_id:
+            try:
+                student.asaas_customer_id = await asaas_service.create_or_get_customer(
+                    name=student.name, phone=student.phone, cpf=student.cpf, email=student.email,
+                )
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Erro ao criar cliente Asaas para {student.name}: {e}")
+                print(f"❌ Erro ao criar cliente no Asaas para {student.name}: {e}", flush=True)
+                return None
+
+        # O Asaas não aceita vencimento no passado: se o vencimento já passou, cobra para hoje
+        charge_due = max(due, today)
+        description = f"Mensalidade {settings.ACADEMY_NAME} ({plan.name}) - {due.strftime('%m/%Y')}"
+        try:
+            charge = await asaas_service.create_pix_charge(
+                customer_id=student.asaas_customer_id,
+                value=plan.price,
+                due_date=charge_due.strftime("%Y-%m-%d"),
+                description=description,
+            )
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Falha ao criar cobrança Asaas para {student.name}: {e}")
+            print(f"❌ Erro ao gerar cobrança para {student.name}: {e}", flush=True)
+            return None
+
+        invoice = Invoice(
+            student_id=student.id,
+            subscription_id=sub.id,
+            amount=plan.price,
+            due_date=charge_due,
+            status="PENDING",
+            asaas_payment_id=charge.get("payment_id"),
+            pix_copy_paste=charge.get("pix_copy_paste"),
+            pix_qr_code_url=charge.get("pix_qr_code_url"),
+            invoice_url=charge.get("invoice_url"),
+        )
+        db.add(invoice)
+        db.commit()
+        print(f"✅ [FATURA CRIADA] {student.name} | {brl(plan.price)} | Vencimento: {charge_due}", flush=True)
+        return invoice
+
+    @staticmethod
+    async def generate_monthly_invoices(db: Session, today: Optional[date] = None) -> int:
+        today = today or today_local()
         subscriptions = (
             db.query(Subscription)
             .join(Student)
-            .filter(Subscription.is_active == True, Student.is_active == True)
+            .filter(Subscription.is_active == True, Student.is_active == True)  # noqa: E712
             .all()
         )
-
-        created_count = 0
-
+        created = 0
         for sub in subscriptions:
-            student = sub.student
-            plan = sub.plan
-
-            # Calcular data de vencimento no mês corrente
-            # Tratar meses com menos dias (ex: dia 31 em fevereiro/abril)
-            try:
-                due_date = date(today.year, today.month, sub.due_day)
-            except ValueError:
-                # Se o dia não existe no mês (ex: 31/02), usa o último dia do mês
-                if today.month in [4, 6, 9, 11]:
-                    due_date = date(today.year, today.month, 30)
-                elif today.month == 2:
-                    is_leap = (today.year % 4 == 0 and today.year % 100 != 0) or (today.year % 400 == 0)
-                    due_date = date(today.year, today.month, 29 if is_leap else 28)
-                else:
-                    due_date = date(today.year, today.month, 28)
-
-            # Se o vencimento deste mês já passou e estamos gerando agora, ou se queremos gerar com antecedência
-            existing_invoice = (
-                db.query(Invoice)
-                .filter(
-                    Invoice.subscription_id == sub.id,
-                    Invoice.due_date >= date(today.year, today.month, 1),
-                    Invoice.due_date <= due_date + timedelta(days=5),
-                )
-                .first()
-            )
-
-            if existing_invoice:
-                print(f"ℹ️  [FATURA EXISTENTE] Aluno {student.name} já possui fatura para este ciclo (Venc: {existing_invoice.due_date}, Status: {existing_invoice.status}).", flush=True)
-                continue
-
-            # 1. Garantir que o aluno tem ID no Asaas
-            if not student.asaas_customer_id:
-                try:
-                    customer_id = await asaas_service.create_or_get_customer(
-                        name=student.name,
-                        phone=student.phone,
-                        cpf=student.cpf,
-                        email=student.email,
+            for due in BillingService.candidate_due_dates(sub, today):
+                exists = (
+                    db.query(Invoice)
+                    .filter(
+                        Invoice.subscription_id == sub.id,
+                        extract("year", Invoice.due_date) == due.year,
+                        extract("month", Invoice.due_date) == due.month,
                     )
-                    student.asaas_customer_id = customer_id
-                    db.commit()
-                except Exception as e:
-                    logger.error(f"Erro ao criar cliente Asaas para {student.name}: {e}")
-                    print(f"❌ Erro ao criar cliente no Asaas para {student.name}: {e}", flush=True)
+                    .first()
+                )
+                if exists:
                     continue
+                if await BillingService.create_invoice(db, sub, due, today):
+                    created += 1
+        return created
 
-            # 2. Criar cobrança no Asaas
-            description = f"Mensalidade Jiu-Jitsu ({plan.name}) - {today.strftime('%m/%Y')}"
-            try:
-                charge_data = await asaas_service.create_pix_charge(
-                    customer_id=student.asaas_customer_id,
-                    value=plan.price,
-                    due_date=due_date.strftime("%Y-%m-%d"),
-                    description=description,
-                )
-
-                invoice = Invoice(
-                    student_id=student.id,
-                    subscription_id=sub.id,
-                    amount=plan.price,
-                    due_date=due_date,
-                    status="PENDING",
-                    asaas_payment_id=charge_data.get("payment_id"),
-                    pix_copy_paste=charge_data.get("pix_copy_paste"),
-                    pix_qr_code_url=charge_data.get("pix_qr_code_url"),
-                    invoice_url=charge_data.get("invoice_url"),
-                )
-                db.add(invoice)
-                db.commit()
-                created_count += 1
-                print(f"✅ [FATURA CRIADA] Aluno: {student.name} | Valor: R$ {plan.price:.2f} | Vencimento: {due_date}", flush=True)
-            except Exception as e:
-                logger.error(f"Falha ao criar cobrança Asaas para {student.name}: {e}")
-                print(f"❌ Erro ao gerar cobrança para {student.name}: {e}", flush=True)
-                db.rollback()
-
-        return created_count
+    # ------------------------------------------------------------------ #
+    # Régua de cobrança
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def template_params(kind: str, inv: Invoice) -> List[str]:
+        """Parâmetros na MESMA ordem das variáveis {{n}} dos templates (ver scripts/create_whatsapp_templates.py)."""
+        name = _first_name(inv.student)
+        pix = inv.pix_copy_paste or inv.invoice_url or "Consulte a secretaria"
+        due = inv.due_date.strftime("%d/%m/%Y")
+        value = brl(inv.amount)
+        if kind == "due_soon":
+            return [name, value, due, pix]
+        if kind == "due_today":
+            return [name, value, pix]
+        if kind == "overdue":
+            return [name, value, due, pix]
+        if kind == "confirmed":
+            return [name, value]
+        raise ValueError(kind)
 
     @staticmethod
-    async def process_billing_reminders(db: Session) -> Dict[str, int]:
-        """
-        Régua de cobrança automática:
-        1. D-3: Faltam 3 dias para o vencimento.
-        2. D-0: Vence hoje.
-        3. D+3: Venceu há 3 dias e continua pendente.
-        """
-        today = date.today()
-        summary = {"d_minus_3": 0, "d_today": 0, "d_overdue": 0}
-
-        # 1. D - 3 (Lembrete amigável)
-        target_date_soon = today + timedelta(days=3)
-        invoices_soon = (
-            db.query(Invoice)
-            .filter(
-                Invoice.status == "PENDING",
-                Invoice.due_date == target_date_soon,
-                Invoice.reminder_sent_soon == False,
+    async def _send_reminder(db: Session, inv: Invoice, kind: str, template: str, flag: str) -> bool:
+        student = inv.student
+        try:
+            await messaging.send_template(
+                db, student.phone, template, BillingService.template_params(kind, inv),
+                student_id=student.id, message_type=f"billing_{kind}",
             )
-            .all()
-        )
+        except WhatsAppError as e:
+            # Não marca como enviado: tenta de novo na próxima execução
+            print(f"❌ [{kind}] Falha ao enviar para {student.name}: {e}", flush=True)
+            return False
+        setattr(inv, flag, True)
+        db.commit()
+        print(f"📤 [{kind}] Enviado para {student.name} ({student.phone})", flush=True)
+        return True
 
-        for inv in invoices_soon:
-            student = inv.student
-            try:
-                # Parâmetros padrão do template: [Nome, Valor, DataVencimento, PixCopiaECola]
-                params = [
-                    student.name.split()[0],
-                    f"R$ {inv.amount:.2f}",
-                    inv.due_date.strftime("%d/%m/%Y"),
-                    inv.pix_copy_paste or "Consulte a secretaria",
-                ]
-                await whatsapp_service.send_template_message(
-                    to_phone=student.phone,
-                    template_name=settings.WHATSAPP_TEMPLATE_DUE_SOON,
-                    parameters=params,
-                )
-                inv.reminder_sent_soon = True
-                
-                db.add(MessageLog(
-                    student_id=student.id,
-                    phone=student.phone,
-                    direction="OUTBOUND",
-                    message_type="template_due_soon",
-                    content=f"Lembrete D-3 enviado para {student.name}",
-                ))
-                db.commit()
-                summary["d_minus_3"] += 1
-            except Exception as e:
-                logger.error(f"Erro ao enviar lembrete D-3 para {student.name}: {e}")
-                db.rollback()
+    @staticmethod
+    async def process_billing_reminders(db: Session, today: Optional[date] = None) -> Dict[str, int]:
+        today = today or today_local()
+        summary = {"d_minus_3": 0, "d_today": 0, "d_overdue": 0, "failed": 0}
 
-        # 2. D - 0 (Vence hoje)
-        invoices_today = (
-            db.query(Invoice)
-            .filter(
-                Invoice.status == "PENDING",
-                Invoice.due_date == today,
-                Invoice.reminder_sent_today == False,
-            )
-            .all()
-        )
+        def active(q):
+            return q.join(Student).filter(Student.is_active == True)  # noqa: E712
 
-        for inv in invoices_today:
-            student = inv.student
-            try:
-                params = [
-                    student.name.split()[0],
-                    f"R$ {inv.amount:.2f}",
-                    inv.pix_copy_paste or "Consulte a secretaria",
-                ]
-                await whatsapp_service.send_template_message(
-                    to_phone=student.phone,
-                    template_name=settings.WHATSAPP_TEMPLATE_DUE_TODAY,
-                    parameters=params,
-                )
-                inv.reminder_sent_today = True
+        # D-3: lembrete amigável
+        for inv in active(db.query(Invoice)).filter(
+            Invoice.status == "PENDING",
+            Invoice.due_date == today + timedelta(days=3),
+            Invoice.reminder_sent_soon == False,  # noqa: E712
+        ).all():
+            ok = await BillingService._send_reminder(db, inv, "due_soon", settings.WHATSAPP_TEMPLATE_DUE_SOON, "reminder_sent_soon")
+            summary["d_minus_3" if ok else "failed"] += 1
 
-                db.add(MessageLog(
-                    student_id=student.id,
-                    phone=student.phone,
-                    direction="OUTBOUND",
-                    message_type="template_due_today",
-                    content=f"Lembrete D-0 enviado para {student.name}",
-                ))
-                db.commit()
-                summary["d_today"] += 1
-            except Exception as e:
-                logger.error(f"Erro ao enviar lembrete D-0 para {student.name}: {e}")
-                db.rollback()
+        # D-0: vence hoje
+        for inv in active(db.query(Invoice)).filter(
+            Invoice.status == "PENDING",
+            Invoice.due_date == today,
+            Invoice.reminder_sent_today == False,  # noqa: E712
+        ).all():
+            ok = await BillingService._send_reminder(db, inv, "due_today", settings.WHATSAPP_TEMPLATE_DUE_TODAY, "reminder_sent_today")
+            summary["d_today" if ok else "failed"] += 1
 
-        # 3. D + 3 (Cobrança de atraso amigável)
-        target_date_overdue = today - timedelta(days=3)
-        invoices_overdue = (
-            db.query(Invoice)
-            .filter(
-                Invoice.status.in_(["PENDING", "OVERDUE"]),
-                Invoice.due_date <= target_date_overdue,
-                Invoice.reminder_sent_overdue == False,
-            )
-            .all()
-        )
+        # Marca como vencidas as que passaram do vencimento
+        for inv in db.query(Invoice).filter(Invoice.status == "PENDING", Invoice.due_date < today).all():
+            inv.status = "OVERDUE"
+        db.commit()
 
-        for inv in invoices_overdue:
-            student = inv.student
-            try:
-                inv.status = "OVERDUE"
-                params = [
-                    student.name.split()[0],
-                    f"R$ {inv.amount:.2f}",
-                    inv.due_date.strftime("%d/%m/%Y"),
-                    inv.pix_copy_paste or "Consulte a secretaria",
-                ]
-                await whatsapp_service.send_template_message(
-                    to_phone=student.phone,
-                    template_name=settings.WHATSAPP_TEMPLATE_OVERDUE,
-                    parameters=params,
-                )
-                inv.reminder_sent_overdue = True
-
-                db.add(MessageLog(
-                    student_id=student.id,
-                    phone=student.phone,
-                    direction="OUTBOUND",
-                    message_type="template_overdue",
-                    content=f"Cobrança de atraso enviada para {student.name}",
-                ))
-                db.commit()
-                summary["d_overdue"] += 1
-            except Exception as e:
-                logger.error(f"Erro ao enviar cobrança de atraso para {student.name}: {e}")
-                db.rollback()
+        # D+3: cobrança de atraso (uma vez)
+        for inv in active(db.query(Invoice)).filter(
+            Invoice.status == "OVERDUE",
+            Invoice.due_date <= today - timedelta(days=3),
+            Invoice.reminder_sent_overdue == False,  # noqa: E712
+        ).all():
+            ok = await BillingService._send_reminder(db, inv, "overdue", settings.WHATSAPP_TEMPLATE_OVERDUE, "reminder_sent_overdue")
+            summary["d_overdue" if ok else "failed"] += 1
 
         return summary
 
+    # ------------------------------------------------------------------ #
+    # Pagamento
+    # ------------------------------------------------------------------ #
     @staticmethod
     async def confirm_payment(db: Session, asaas_payment_id: str) -> bool:
-        """
-        Recebe a confirmação de pagamento do webhook Asaas, atualiza o banco
-        e envia mensagem de agradecimento pelo WhatsApp.
-        """
-        invoice = (
-            db.query(Invoice)
-            .filter(Invoice.asaas_payment_id == asaas_payment_id)
-            .first()
-        )
-
+        """Webhook Asaas confirmou o pagamento: dá baixa e agradece pelo WhatsApp."""
+        invoice = db.query(Invoice).filter(Invoice.asaas_payment_id == asaas_payment_id).first()
         if not invoice:
             logger.warning(f"Pagamento recebido para fatura não encontrada: {asaas_payment_id}")
             return False
-
         if invoice.status == "PAID":
-            return True
+            return True  # Asaas manda RECEIVED e CONFIRMED; agradece só uma vez
 
         invoice.status = "PAID"
         invoice.paid_at = datetime.utcnow()
-        student = invoice.student
-
-        db.add(MessageLog(
-            student_id=student.id,
-            phone=student.phone,
-            direction="OUTBOUND",
-            message_type="payment_confirmation",
-            content=f"Pagamento confirmado para fatura {invoice.id} - R$ {invoice.amount:.2f}",
-        ))
         db.commit()
+        student = invoice.student
+        print(f"💚 [PAGO] {student.name} pagou {brl(invoice.amount)} (fatura {invoice.id})", flush=True)
 
-        # Enviar mensagem no WhatsApp confirmando recebimento
         try:
-            params = [student.name.split()[0], f"R$ {invoice.amount:.2f}"]
-            await whatsapp_service.send_template_message(
-                to_phone=student.phone,
-                template_name=settings.WHATSAPP_TEMPLATE_PAYMENT_CONFIRMED,
-                parameters=params,
+            await messaging.send_template(
+                db, student.phone, settings.WHATSAPP_TEMPLATE_PAYMENT_CONFIRMED,
+                BillingService.template_params("confirmed", invoice),
+                student_id=student.id, message_type="billing_confirmed",
             )
-        except Exception as e:
-            logger.error(f"Erro ao notificar confirmação de pagamento ao aluno {student.name}: {e}")
-
+        except WhatsAppError as e:
+            logger.error(f"Erro ao notificar pagamento ao aluno {student.name}: {e}")
         return True
-

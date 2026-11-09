@@ -89,4 +89,28 @@ class MessageLog(Base):
     direction = Column(String(10), nullable=False)  # INBOUND ou OUTBOUND
     message_type = Column(String(20), default="text")
     content = Column(Text, nullable=False)
+    wamid = Column(String(128), nullable=True, index=True)  # ID da mensagem na Meta
+    status = Column(String(20), nullable=True)  # sent, delivered, read, failed
+    error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ProcessedWebhookMessage(Base):
+    """IDs (wamid) de mensagens já processadas. A Meta reenvia webhooks; isso evita respostas duplicadas."""
+    __tablename__ = "processed_webhook_messages"
+
+    wamid = Column(String(128), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Conversation(Base):
+    """Estado da conversa por telefone (ex.: aluno pediu atendimento humano e o bot deve ficar em silêncio)."""
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String(20), unique=True, index=True, nullable=False)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
+    handoff_until = Column(DateTime, nullable=True)  # UTC; enquanto no futuro, o bot não responde
+    handoff_reason = Column(Text, nullable=True)
+    last_inbound_at = Column(DateTime, nullable=True)  # UTC; janela de 24h da Meta para texto livre
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
